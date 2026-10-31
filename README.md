@@ -6,7 +6,7 @@ The catalog contains 56 problems and 1,641 example plus deterministic generated 
 
 ## Supabase setup
 
-The project URL and public publishable key are set in `config.js`. The SQL migration is in `supabase/competitions.sql`; the subscriptions table used by this app is created by `supabase/schema.sql`. These have been applied to the Supabase project. For a new project, run `schema.sql` first, then `competitions.sql`.
+The project URL and public publishable key are set in `config.js`. The SQL migration is in `supabase/competitions.sql`, and it has been applied to the Supabase project. For a new project, run that file once in the Supabase SQL Editor.
 
 Set the Supabase Auth site URL and allowed redirect URL to the GitHub Pages URL (for this repository: `https://herby-code01.github.io/leetcomp.v.3/`). Use email confirmation for new accounts. Never put a Supabase secret key or database password in this public repository.
 

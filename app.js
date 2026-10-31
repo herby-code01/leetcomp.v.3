@@ -4,8 +4,12 @@
   const DB_NAME = 'leetcomp-pages-sqlite';
   const SESSION_KEY = 'leetcomp-pages-user';
   const $ = (id) => document.getElementById(id);
+  const sb = window.LEETCOMP_CONFIG && !window.LEETCOMP_CONFIG.supabaseUrl?.includes('YOUR_') && !window.LEETCOMP_CONFIG.supabaseAnonKey?.includes('YOUR_') && window.supabase?.createClient(
+    window.LEETCOMP_CONFIG.supabaseUrl, window.LEETCOMP_CONFIG.supabaseAnonKey
+  );
   let SQL, database, currentUser = null, selectedTopic = DATA.topics[0].id, selectedProblem = null;
-  let attemptId = null, attemptDeadline = null, timerHandle = null, saveHandle = null;
+  let boardOffset = 0, observedUtcDay = dayString();
+  let attemptId = null, attemptDeadline = null, sharedAttemptId = null, sharedBoardError = null, timerHandle = null, saveHandle = null;
   let editor = null, judgeWorker = null, judgeJob = 0, pendingJobs = new Map();
   let judgeBusy = false, pendingFinish = false, submitting = false, finished = false, authMode = 'login';
 
@@ -77,7 +81,7 @@
     return bytesHex(bits);
   }
   function safeText(el, value) { el.textContent = value == null ? '' : String(value); }
-  function dayString(d = new Date()) { return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; }
+  function dayString(d = new Date()) { return d.toISOString().slice(0, 10); }
   function dayOrdinal() { const [y,m,d] = dayString().split('-').map(Number); return Math.floor(Date.UTC(y,m-1,d) / 86400000); }
   function todayProblem(topic) {
     const pool = DATA.problems.filter(p => p.topic === topic), i = DATA.topics.findIndex(t => t.id === topic);
@@ -92,36 +96,55 @@
     $('showLogin').classList.toggle('active', mode === 'login'); $('showSignup').classList.toggle('active', mode === 'signup');
     $('authSubmit').textContent = mode === 'login' ? 'Sign in' : 'Create account';
     $('password').autocomplete = mode === 'login' ? 'current-password' : 'new-password';
+    document.querySelectorAll('.signup-only').forEach(el => el.hidden = mode !== 'signup');
+    document.querySelectorAll('.login-only').forEach(el => el.hidden = mode === 'signup');
+    $('loginEmail').required = mode === 'login'; $('email').required = mode === 'signup'; $('username').required = mode === 'signup';
     safeText($('authMessage'), '');
+  }
+  async function syncLocalUser(authUser) {
+    const username = authUser.user_metadata?.username || authUser.email.split('@')[0].replace(/[^A-Za-z0-9_]/g, '').slice(0, 20) || 'coder';
+    let user = row('SELECT id,username FROM users WHERE username=?', [username]);
+    if (!user) {
+      const salt = bytesHex(crypto.getRandomValues(new Uint8Array(16)));
+      sqlRun('INSERT INTO users(username,salt,password_hash,created_at) VALUES(?,?,?,?)', [username, salt, 'supabase-auth', new Date().toISOString()]);
+      await persist(); user = row('SELECT id,username FROM users WHERE username=?', [username]);
+    }
+    currentUser = { ...user, authUid: authUser.id };
+    $('userName').textContent = currentUser.username;
   }
   async function authSubmit(event) {
     event.preventDefault(); safeText($('authMessage'), ''); $('authSubmit').disabled = true;
-    const username = $('username').value.trim(), password = $('password').value;
     try {
-      if (username.length < 3 || username.length > 20) throw new Error('Username must be 3 to 20 characters.');
+      if (!sb) throw new Error('Sign-in is not configured yet. Add your Supabase project URL and public key to config.js.');
+      const password = $('password').value;
+      const email = authMode === 'login' ? $('loginEmail').value.trim() : $('email').value.trim();
+      const username = $('username').value.trim();
       if (password.length < 8) throw new Error('Use a password with at least 8 characters.');
       if (authMode === 'signup') {
+        if (username.length < 3 || username.length > 20) throw new Error('Username must be 3 to 20 characters.');
         if (!/^[A-Za-z0-9_]+$/.test(username)) throw new Error('Use letters, numbers, or underscores for your username.');
-        if (row('SELECT id FROM users WHERE username = ?', [username])) throw new Error('That username is already registered in this browser.');
-        const salt = crypto.getRandomValues(new Uint8Array(16));
-        const saltText = bytesHex(salt), hash = await passwordHash(password, saltText);
-        sqlRun('INSERT INTO users(username,salt,password_hash,created_at) VALUES(?,?,?,?)', [username,saltText,hash,new Date().toISOString()]);
-        await persist(); currentUser = row('SELECT id,username FROM users WHERE username=?', [username]);
+        const { data, error } = await sb.auth.signUp({ email, password, options: { data: { username } } });
+        if (error) throw error;
+        if (!data.session) { safeText($('authMessage'), 'Check your email to confirm your account, then sign in.'); return; }
+        await syncLocalUser(data.user);
       } else {
-        const user = row('SELECT id,username,salt,password_hash FROM users WHERE username=?', [username]);
-        if (!user || await passwordHash(password, user.salt) !== user.password_hash) throw new Error('Username or password is incorrect for this browser.');
-        currentUser = { id: user.id, username: user.username };
+        const { data, error } = await sb.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+        await syncLocalUser(data.user);
       }
       localStorage.setItem(SESSION_KEY, String(currentUser.id)); $('authView').hidden = true; $('appView').hidden = false; $('signOut').hidden = false;
-      $('userName').textContent = currentUser.username; renderHome(); resumeRace();
+      renderHome(); await resumeRace();
     } catch (error) { safeText($('authMessage'), error.message || 'Could not sign in.'); }
     finally { $('authSubmit').disabled = false; }
   }
-  function signOut() { currentUser = null; localStorage.removeItem(SESSION_KEY); $('appView').hidden = true; $('arenaView').hidden = true; $('authView').hidden = false; $('signOut').hidden = true; safeText($('userName'), ''); }
-  function restoreSession() {
-    const id = Number(localStorage.getItem(SESSION_KEY));
-    currentUser = Number.isInteger(id) && id > 0 ? row('SELECT id,username FROM users WHERE id=?', [id]) : null;
-    if (currentUser) { $('authView').hidden = true; $('appView').hidden = false; $('signOut').hidden = false; $('userName').textContent = currentUser.username; renderHome(); resumeRace(); }
+  async function signOut() { await sb?.auth.signOut(); currentUser = null; localStorage.removeItem(SESSION_KEY); $('appView').hidden = true; $('arenaView').hidden = true; $('authView').hidden = false; $('signOut').hidden = true; safeText($('userName'), ''); }
+  async function restoreSession() {
+    if (!sb) return;
+    const { data } = await sb.auth.getSession();
+    if (data.session?.user) {
+      await syncLocalUser(data.session.user); $('authView').hidden = true; $('appView').hidden = false; $('signOut').hidden = false;
+      renderHome(); await resumeRace();
+    }
   }
 
   function renderTopics() {
@@ -147,35 +170,45 @@
     $('enterArena').textContent = old ? (old.state === 'live' ? 'Return to lockdown' : 'Race completed today') : 'Enter lockdown';
     renderTopics(); renderBoard();
   }
-  function getArenaRows(day, topic) {
-    const all = rows(`SELECT a.*,u.username FROM attempts a JOIN users u ON u.id=a.user_id WHERE a.day=? AND a.topic=? ORDER BY a.submitted_at,a.id`, [day,topic]);
-    const accepted = all.filter(a => Number(a.accepted) === 1), times = accepted.filter(a=>a.runtime_ms!=null&&Number.isFinite(Number(a.runtime_ms))).map(a=>Number(a.runtime_ms)), mems = accepted.filter(a=>a.memory_mb!=null&&Number.isFinite(Number(a.memory_mb))).map(a=>Number(a.memory_mb));
-    function pct(value, values) { if (!Number.isFinite(value) || !values.length) return 0; if (values.length === 1) return 100; const worse=values.filter(v=>v>value).length,ties=values.filter(v=>v===value).length-1; return Math.round((worse+ties*.5)/(values.length-1)*10000)/100; }
-    const ranked=accepted.map(a=>{const timePct=pct(a.runtime_ms==null?NaN:Number(a.runtime_ms),times),spacePct=pct(a.memory_mb==null?NaN:Number(a.memory_mb),mems);return {...a,timePct,spacePct,score:Math.round((timePct+spacePct)*50)/100};}).sort((a,b)=>b.score-a.score||Number(a.submitted_at)-Number(b.submitted_at));
-    let lastScore=null,lastRank=0;ranked.forEach((r,i)=>{r.rank=r.score===lastScore?lastRank:i+1;lastScore=r.score;lastRank=r.rank;});
-    const rankMap=new Map(ranked.map(r=>[r.id,r]));
-    return all.map(a=>rankMap.get(a.id)||({...a,rank:null,score:null,timePct:null,spacePct:null})).sort((a,b)=>(a.rank||99999)-(b.rank||99999)||a.username.localeCompare(b.username));
+  async function renderBoard(day = new Date(Date.now()-boardOffset*86400000).toISOString().slice(0,10), topic = selectedTopic) {
+    if (!sb || !currentUser?.authUid) { $('leaderboard').innerHTML='<div class="empty">Sign in to view shared standings.</div>'; return []; }
+    $('leaderboard').setAttribute('aria-busy','true');
+    const {data,error}=await sb.rpc('get_topic_leaderboard',{p_day:day,p_topic:topic});
+    $('leaderboard').removeAttribute('aria-busy');
+    if(error){$('leaderboard').innerHTML='<div class="empty">Shared standings are unavailable. Apply the competition SQL setup and refresh.</div>';return [];}
+    const list=data||[];
+    $('leaderboard').innerHTML = list.length ? list.slice(0,10).map(r=>`<div class="board-row ${r.rank===1?'leader':''}"><span>${r.rank ? String(r.rank).padStart(2,'0') : '—'}</span><span>${escapeHTML(r.username)}<small>${r.accepted?`Time ${Number(r.time_pct).toFixed(1)}% · Space ${Number(r.space_pct).toFixed(1)}%`:(r.state==='live'?'In the arena':escapeHTML(r.verdict||'Not accepted'))}</small></span><span>${r.score==null?'—':Number(r.score).toFixed(1)+' pts'}</span></div>`).join('') : '<div class="empty">No entries yet. Start today’s race.</div>';
+    const past=day<dayString();
+    $('boardStatus').textContent=past?'FINAL RESULTS':'LIVE · UPDATES AS PLAYERS SUBMIT';
+    $('boardDayToggle').textContent=boardOffset?'View today’s live board':'View yesterday’s final';
+    return list;
   }
-  function renderBoard() {
-    const list=getArenaRows(dayString(),selectedTopic);
-    $('leaderboard').innerHTML = list.length ? list.slice(0,10).map((r,i)=>`<div class="board-row"><span>${r.rank ? String(r.rank).padStart(2,'0') : '—'}</span><span>${escapeHTML(r.username)}<small>${r.accepted===1?`Time ${Number(r.timePct).toFixed(1)}% · Space ${Number(r.spacePct).toFixed(1)}%`:escapeHTML(r.verdict||'In progress')}</small></span><span>${r.score==null?'—':r.score.toFixed(1)+' pts'}</span></div>`).join('') : '<div class="empty">No entries yet. Start the first race.</div>';
-  }
-  function totalWins() {
-    const days=rows('SELECT DISTINCT day,topic FROM attempts WHERE user_id=? AND day < ?', [currentUser.id,dayString()]); let count=0;
-    for(const item of days){const winner=getArenaRows(item.day,item.topic).find(r=>r.rank===1);if(winner&&winner.user_id===currentUser.id)count++;}
-    return count;
-  }
-  function renderDashboard() {
+  async function totalWins() { if(!sb||!currentUser?.authUid)return 0;const {data,error}=await sb.rpc('get_my_competition_wins');return error?0:Number(data)||0; }
+  async function renderDashboard() {
     const all=rows('SELECT a.*,u.username FROM attempts a JOIN users u ON u.id=a.user_id WHERE a.user_id=? ORDER BY a.day DESC,a.id DESC LIMIT 30',[currentUser.id]);
-    const accepted=all.filter(a=>a.accepted===1).length,wins=totalWins();
+    const accepted=all.filter(a=>a.accepted===1).length,wins=await totalWins();
     $('winTotal').textContent=wins;$('dashWins').textContent=wins;$('dashRaces').textContent=all.length;$('dashAccepted').textContent=accepted;
-    $('history').innerHTML=all.length?all.slice(0,8).map(a=>{const p=DATA.problems.find(x=>x.id===a.problem_id);const rank=getArenaRows(a.day,a.topic).find(x=>x.user_id===currentUser.id);return `<div class="history-row"><span>${a.accepted===1?(rank&&rank.rank===1&&a.day<dayString()?'🏆':'✓'):'·'}</span><span>${escapeHTML(p?p.title:a.problem_id)}<small>${escapeHTML(a.day)} · ${escapeHTML(DATA.topics.find(t=>t.id===a.topic)?.name||a.topic)} · ${escapeHTML(a.verdict||'In progress')}</small></span><b>${a.accepted===1&&rank?`#${rank.rank}`:'—'}</b></div>`}).join(''):'<div class="empty">Your completed races will appear here.</div>';
+    const recent=all.slice(0,8),keys=[...new Set(recent.map(a=>`${a.day}|${a.topic}`))],shared=new Map();
+    await Promise.all(keys.map(async key=>{const [day,topic]=key.split('|');const {data,error}=await sb.rpc('get_topic_leaderboard',{p_day:day,p_topic:topic});if(!error)shared.set(key,data||[]);}));
+    $('history').innerHTML=recent.length?recent.map(a=>{const p=DATA.problems.find(x=>x.id===a.problem_id),board=shared.get(`${a.day}|${a.topic}`)||[],rank=board.find(x=>x.user_id===currentUser.authUid);return `<div class="history-row"><span>${a.accepted===1?(rank&&rank.rank===1&&a.day<dayString()?'🏆':'✓'):'·'}</span><span>${escapeHTML(p?p.title:a.problem_id)}<small>${escapeHTML(a.day)} · ${escapeHTML(DATA.topics.find(t=>t.id===a.topic)?.name||a.topic)} · ${escapeHTML(a.verdict||'In progress')}</small></span><b>${rank&&rank.rank?`#${rank.rank}`:'—'}</b></div>`}).join(''):'<div class="empty">Your completed races will appear here.</div>';
+    const {data:latestWin}=await sb.rpc('get_my_latest_win');
+    if(latestWin?.length){const win=latestWin[0],topicName=DATA.topics.find(t=>t.id===win.topic)?.name||win.topic;$('winNotice').textContent=`🏆 You won ${topicName} on ${win.competition_day}. Final standings are in the shared board.`;$('winNotice').hidden=false;}else $('winNotice').hidden=true;
   }
   function renderHome() {
-    $('todayLabel').textContent=new Intl.DateTimeFormat(undefined,{weekday:'short',month:'short',day:'numeric'}).format(new Date()).toUpperCase();
+    $('todayLabel').textContent=new Intl.DateTimeFormat(undefined,{weekday:'short',month:'short',day:'numeric',timeZone:'UTC'}).format(new Date()).toUpperCase();
     chooseProblem();renderDashboard();
   }
   function updateTopic(topic) { selectedTopic=topic; chooseProblem(); }
+
+  async function createSharedEntry(day, problem, start, deadline, resume = false) {
+    sharedAttemptId=null; sharedBoardError=null;
+    const {data:prior,error:lookupError}=await sb.from('competition_attempts').select('id,state').eq('user_id',currentUser.authUid).eq('competition_day',day).eq('topic',selectedTopic).maybeSingle();
+    if(lookupError)throw new Error('Shared competition setup is unavailable. Run supabase/competitions.sql, then reload.');
+    if(prior){sharedAttemptId=prior.id;if(prior.state==='done')throw new Error('You already submitted this topic today. Your shared result is on the leaderboard.');if(resume)return;throw new Error('Your entry for this topic is already active on another browser. Continue there or wait for the timer to finish.');}
+    const {data,error}=await sb.from('competition_attempts').insert({user_id:currentUser.authUid,username:currentUser.username,competition_day:day,topic:selectedTopic,problem_id:problem.id,state:'live',started_at:new Date(start).toISOString(),deadline_at:new Date(deadline).toISOString()}).select('id').single();
+    if(error)throw new Error('Could not create your shared entry: '+error.message);
+    sharedAttemptId=data.id;
+  }
 
   function saveAttempt(code) {
     if(!attemptId||finished)return Promise.resolve();
@@ -199,10 +232,11 @@
     window.history.pushState({locked:true},'',location.href);
     if(document.documentElement.requestFullscreen)document.documentElement.requestFullscreen().catch(()=>{});
   }
-  function resumeRace() {
+  async function resumeRace() {
     const live=row('SELECT * FROM attempts WHERE user_id=? AND state=? ORDER BY started_at DESC LIMIT 1',[currentUser.id,'live']);
     if(!live)return;
     selectedTopic=live.topic;selectedProblem=DATA.problems.find(p=>p.id===live.problem_id);attemptId=live.id;attemptDeadline=live.deadline_at;
+    try{await createSharedEntry(live.day,selectedProblem,live.started_at,live.deadline_at,true);}catch(error){safeText($('boardStatus'),error.message);return;}
     finished=false;submitting=false;showLockdown();clearInterval(timerHandle);timerHandle=setInterval(tick,250);tick();
   }
   function tick() {
@@ -213,9 +247,10 @@
   function fmt(ms){const s=Math.max(0,Math.ceil(ms/1000));return `${String(Math.floor(s/60)).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`;}
   async function enterArena() {
     const day=dayString(),old=attemptFor(day,selectedTopic);selectedProblem=todayProblem(selectedTopic);
-    if(old){if(old.state==='done'){showResultFor(old);return;}attemptId=old.id;attemptDeadline=old.deadline_at;}
+    if(old){if(old.state==='done'){showResultFor(old);return;}attemptId=old.id;attemptDeadline=old.deadline_at;try{await createSharedEntry(day,selectedProblem,old.started_at,old.deadline_at,true);}catch(error){safeText($('boardStatus'),error.message);return;}}
     else {
       const start=Date.now(),deadline=start+minutes(selectedProblem)*60000;
+      try{await createSharedEntry(day,selectedProblem,start,deadline);}catch(error){safeText($('boardStatus'),error.message);await renderBoard();return;}
       sqlRun('INSERT INTO attempts(user_id,day,topic,problem_id,state,code,started_at,deadline_at) VALUES(?,?,?,?,?,?,?,?)',[currentUser.id,day,selectedTopic,selectedProblem.id,'live',codeStarter(selectedProblem),start,deadline]);
       attemptId=rows('SELECT last_insert_rowid() AS id')[0].id;attemptDeadline=deadline;await persist();
     }
@@ -259,33 +294,37 @@
       sqlRun('UPDATE attempts SET state=?,submitted_at=?,accepted=?,passed=?,total=?,runtime_ms=?,memory_mb=?,verdict=?,error=? WHERE id=?',[
         'done',submitted,result.accepted?1:0,result.passed,result.total,result.runtime_ms,result.memory_mb,
         result.accepted?'Accepted':'Not accepted',result.error||(result.first_fail?`Case ${result.first_fail.case} did not pass.`:null),attemptId]);
-      await persist();showFinalResult(result,submitted);
+      await persist();
+      if(sharedAttemptId){const {error}=await sb.from('competition_attempts').update({state:'done',submitted_at:new Date(submitted).toISOString(),accepted:!!result.accepted,passed:result.passed,total:result.total,runtime_ms:result.runtime_ms,memory_mb:result.memory_mb,verdict:result.accepted?'Accepted':'Not accepted'}).eq('id',sharedAttemptId);if(error)sharedBoardError='Your result was saved on this device, but could not be uploaded to the shared leaderboard: '+error.message;}
+      await showFinalResult(result,submitted);
     } catch(error) {
       sqlRun('UPDATE attempts SET state=?,submitted_at=?,accepted=0,verdict=?,error=? WHERE id=?',['done',Date.now(),'Judge error',error.message,attemptId]);await persist();
-      showFinalResult({accepted:false,error:error.message,passed:0,total:selectedProblem.cases.length,runtime_ms:null,memory_mb:null},Date.now());
+      if(sharedAttemptId){const {error:uploadError}=await sb.from('competition_attempts').update({state:'done',submitted_at:new Date().toISOString(),accepted:false,passed:0,total:selectedProblem.cases.length,verdict:'Judge error'}).eq('id',sharedAttemptId);if(uploadError)sharedBoardError='The judge error could not be uploaded to the shared leaderboard.';}
+      await showFinalResult({accepted:false,error:error.message,passed:0,total:selectedProblem.cases.length,runtime_ms:null,memory_mb:null},Date.now());
     }
   }
-  function fieldPct(value,values){if(!Number.isFinite(value)||!values.length)return 0;if(values.length===1)return 100;const worse=values.filter(v=>v>value).length,ties=values.filter(v=>v===value).length-1;return Math.round((worse+ties*.5)/(values.length-1)*10000)/100;}
-  function showFinalResult(result,submitted) {
+  async function showFinalResult(result,submitted) {
     clearInterval(timerHandle);document.body.classList.remove('locked');if(document.fullscreenElement&&document.exitFullscreen)document.exitFullscreen().catch(()=>{});
     $('arenaView').hidden=true;$('resultDialog').hidden=false;
-    const day=dayString(new Date(attemptDeadline-minutes(selectedProblem)*60000)),list=getArenaRows(day,selectedTopic),mine=list.find(r=>r.id===attemptId);
+    const day=dayString(new Date(attemptDeadline-minutes(selectedProblem)*60000)),list=await renderBoard(day,selectedTopic),mine=list.find(r=>r.attempt_id===sharedAttemptId);
     $('resultTitle').textContent=result.accepted?(mine&&mine.rank===1&&day<dayString()?'Daily arena winner!':'Accepted'): 'Submission not accepted';
-    $('resultText').textContent=result.accepted?'Your Python code passed the example and generated cases. Runtime and memory are measured in this browser and compared with other accepted entries saved in this browser.':(result.error||'Some simple or generated edge cases did not pass. You can review your code on the dashboard.');
+    $('resultText').textContent=(result.accepted?'Your Python code passed the example and generated cases. Runtime and memory are compared with accepted entrants in today’s shared topic competition.':(result.error||'Some simple or generated edge cases did not pass. You can review your code on the dashboard.'))+(sharedBoardError?' '+sharedBoardError:'');
     const stat=(label,value)=>`<div><small>${label}</small><b>${value}</b></div>`;
-    let stats='';if(mine&&mine.rank)stats+=stat('LOCAL RANK','#'+mine.rank);if(mine&&mine.score!=null)stats+=stat('SCORE',mine.score.toFixed(1));
+    let stats='';if(mine&&mine.rank)stats+=stat('LIVE RANK','#'+mine.rank);if(mine&&mine.score!=null)stats+=stat('SCORE',Number(mine.score).toFixed(1));
     stats+=stat('RUNTIME',Number.isFinite(result.runtime_ms)?result.runtime_ms.toFixed(2)+' ms':'—');
     stats+=stat('MEMORY',Number.isFinite(result.memory_mb)?result.memory_mb.toFixed(3)+' MB':'—');
-    if(mine&&mine.rank){stats+=stat('TIME VS LOCAL FIELD',mine.timePct.toFixed(1)+'%');stats+=stat('SPACE VS LOCAL FIELD',mine.spacePct.toFixed(1)+'%');}
+    if(mine&&mine.rank){stats+=stat('TIME VS FIELD',Number(mine.time_pct).toFixed(1)+'%');stats+=stat('SPACE VS FIELD',Number(mine.space_pct).toFixed(1)+'%');}
     $('resultStats').innerHTML=stats;safeText($('exitLockdown'),'Submit & exit');$('exitLockdown').disabled=false;renderHome();
   }
-  function showResultFor(attempt) {
+  async function showResultFor(attempt) {
     selectedTopic=attempt.topic;selectedProblem=DATA.problems.find(p=>p.id===attempt.problem_id);attemptId=attempt.id;attemptDeadline=attempt.deadline_at;
-    const result={accepted:attempt.accepted===1,error:attempt.error,passed:attempt.passed,total:attempt.total,runtime_ms:attempt.runtime_ms,memory_mb:attempt.memory_mb};showFinalResult(result,attempt.submitted_at);
+    const {data}=await sb.from('competition_attempts').select('id').eq('user_id',currentUser.authUid).eq('competition_day',attempt.day).eq('topic',attempt.topic).maybeSingle();sharedAttemptId=data?.id||null;
+    const result={accepted:attempt.accepted===1,error:attempt.error,passed:attempt.passed,total:attempt.total,runtime_ms:attempt.runtime_ms,memory_mb:attempt.memory_mb};await showFinalResult(result,attempt.submitted_at);
   }
   function bind() {
     $('showLogin').onclick=()=>setAuthMode('login');$('showSignup').onclick=()=>setAuthMode('signup');$('authForm').addEventListener('submit',authSubmit);$('signOut').onclick=signOut;
     $('topics').addEventListener('click',e=>{const b=e.target.closest('[data-topic]');if(b)updateTopic(b.dataset.topic);});
+    $('boardDayToggle').onclick=()=>{boardOffset=boardOffset?0:1;renderBoard();};
     $('enterArena').onclick=enterArena;$('runCode').onclick=runCode;$('submitCode').onclick=()=>finishRace(false);$('exitLockdown').onclick=()=>finishRace(false);
     $('returnHome').onclick=()=>{ $('resultDialog').hidden=true;$('siteHeader').hidden=false;$('appView').hidden=false;renderHome(); };
     $('clearData').onclick=async()=>{if(!confirm('Delete all LeetComp accounts, races, and scores stored in this browser?'))return;localStorage.removeItem(SESSION_KEY);database.close();(await idb()).close();const req=indexedDB.deleteDatabase(DB_NAME);req.onsuccess=()=>location.reload();req.onerror=()=>alert('The browser could not clear the local database.');};
@@ -295,7 +334,7 @@
   }
   async function boot() {
     bind();
-    try{await initDatabase();restoreSession();}
+    try{await initDatabase();await restoreSession();setInterval(()=>{if(currentUser?.authUid&&!$('appView').hidden){if(observedUtcDay!==dayString()){observedUtcDay=dayString();boardOffset=0;renderHome();}else renderBoard();}},10000);}
     catch(error){$('authView').hidden=false;$('authMessage').textContent=error.message||'Could not load the local database.';}
   }
   boot();

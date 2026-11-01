@@ -85,7 +85,7 @@
   function applyTheme(theme = localStorage.getItem('leetcomp-theme') || 'midnight') {
     if (!THEMES.has(theme)) theme = 'midnight';
     document.documentElement.dataset.theme = theme;
-    const select = $('themeSelect'); if (select) select.value = theme;
+    document.querySelectorAll('input[name=themeChoice]').forEach(input => { input.checked = input.value === theme; });
   }
   function renderSettings() {
     if (!currentUser) return;
@@ -103,7 +103,7 @@
       const { error: profileError } = await sb.from('profiles').update({ display_name: displayName, updated_at: new Date().toISOString() }).eq('id', currentUser.authUid);
       if (profileError) throw profileError;
       currentUser.displayName = displayName; currentUser.userMetadata = data.user.user_metadata;
-      $('userName').textContent = displayName; safeText($('profileMessage'), 'Profile saved.');
+      $('userName').textContent = displayName; $('dropdownName').textContent = displayName; safeText($('profileMessage'), 'Profile saved.');
     } catch (error) { safeText($('profileMessage'), error.message || 'Could not save profile.'); }
     finally { $('saveProfile').disabled = false; }
   }
@@ -165,7 +165,7 @@
       await persist(); user = row('SELECT id,username FROM users WHERE username=?', [username]);
     }
     currentUser = { ...user, authUid: authUser.id, email: authUser.email, displayName, userMetadata: metadata };
-    $('userName').textContent = displayName;
+    $('userName').textContent = displayName; $('dropdownName').textContent = displayName;
     renderSettings();
   }
   async function authSubmit(event) {
@@ -190,12 +190,12 @@
         if (error) throw error;
         await syncLocalUser(data.user);
       }
-      localStorage.setItem(SESSION_KEY, String(currentUser.id)); $('authView').hidden = true; $('appView').hidden = false; $('signOut').hidden = false;
-      renderHome(); await resumeRace();
+      localStorage.setItem(SESSION_KEY, String(currentUser.id)); $('authView').hidden = true; $('appView').hidden = false; $('userMenu').hidden = false;
+      renderHome(); routeFromHash(); await resumeRace();
     } catch (error) { safeText($('authMessage'), error.message || 'Could not sign in.'); }
     finally { $('authSubmit').disabled = false; }
   }
-  async function signOut() { await sb?.auth.signOut(); currentUser = null; localStorage.removeItem(SESSION_KEY); $('appView').hidden = true; $('arenaView').hidden = true; $('authView').hidden = false; $('signOut').hidden = true; safeText($('userName'), ''); }
+  async function signOut() { await sb?.auth.signOut(); currentUser = null; localStorage.removeItem(SESSION_KEY); $('appView').hidden = true; $('arenaView').hidden = true; $('authView').hidden = false; $('userMenu').hidden = true; $('userDropdown').hidden = true; safeText($('userName'), ''); }
   async function restoreSession() {
     if (!sb) return;
     const { data } = await sb.auth.getSession();
@@ -203,8 +203,8 @@
     const isPasswordRecovery = new URLSearchParams(location.search).get('password-reset') === '1' || hashParams.get('type') === 'recovery';
     if (isPasswordRecovery && data.session?.user) { $('authView').hidden = true; $('recoveryView').hidden = false; return; }
     if (data.session?.user) {
-      await syncLocalUser(data.session.user); $('authView').hidden = true; $('appView').hidden = false; $('signOut').hidden = false;
-      renderHome(); await resumeRace();
+      await syncLocalUser(data.session.user); $('authView').hidden = true; $('appView').hidden = false; $('userMenu').hidden = false;
+      renderHome(); routeFromHash(); await resumeRace();
     }
   }
 
@@ -254,6 +254,16 @@
     $('history').innerHTML=recent.length?recent.map(a=>{const p=DATA.problems.find(x=>x.id===a.problem_id),board=shared.get(`${a.day}|${a.topic}`)||[],rank=board.find(x=>x.user_id===currentUser.authUid);return `<div class="history-row"><span>${a.accepted===1?(rank&&rank.rank===1&&a.day<dayString()?'🏆':'✓'):'·'}</span><span>${escapeHTML(p?p.title:a.problem_id)}<small>${escapeHTML(a.day)} · ${escapeHTML(DATA.topics.find(t=>t.id===a.topic)?.name||a.topic)} · ${escapeHTML(a.verdict||'In progress')}</small></span><b>${rank&&rank.rank?`#${rank.rank}`:'—'}</b></div>`}).join(''):'<div class="empty">Your completed races will appear here.</div>';
     const {data:latestWin}=await sb.rpc('get_my_latest_win');
     if(latestWin?.length){const win=latestWin[0],topicName=DATA.topics.find(t=>t.id===win.topic)?.name||win.topic;$('winNotice').textContent=`🏆 You won ${topicName} on ${win.competition_day}. Final standings are in the shared board.`;$('winNotice').hidden=false;}else $('winNotice').hidden=true;
+  }
+  function routeFromHash() {
+    if ($('appView').hidden || !$('settingsPage')) return;
+    const isSettings = location.hash === '#settings';
+    $('homePage').hidden = isSettings; $('settingsPage').hidden = !isSettings;
+    if (isSettings) renderSettings();
+  }
+  function navigateToSettings() {
+    if (location.hash !== '#settings') history.pushState({ page: 'settings' }, '', '#settings');
+    routeFromHash(); window.scrollTo({ top: 0, behavior: 'smooth' });
   }
   function renderHome() {
     $('todayLabel').textContent=new Intl.DateTimeFormat(undefined,{weekday:'short',month:'short',day:'numeric',timeZone:'UTC'}).format(new Date()).toUpperCase();
@@ -385,13 +395,19 @@
   function bind() {
     applyTheme();
     $('showLogin').onclick=()=>setAuthMode('login');$('showSignup').onclick=()=>setAuthMode('signup');$('authForm').addEventListener('submit',authSubmit);$('signOut').onclick=signOut;
+    $('userMenuButton').onclick=()=>{const open=$('userDropdown').hidden;$('userDropdown').hidden=!open;$('userMenuButton').setAttribute('aria-expanded',String(open));};
+    $('openSettings').onclick=()=>{$('userDropdown').hidden=true;$('userMenuButton').setAttribute('aria-expanded','false');navigateToSettings();};
+    $('backFromSettings').onclick=()=>{history.pushState({page:'home'},'','#home');routeFromHash();window.scrollTo({top:0,behavior:'smooth'});};
+    document.addEventListener('click',e=>{if(!e.target.closest('#userMenu')){$('userDropdown').hidden=true;$('userMenuButton').setAttribute('aria-expanded','false');}});
+    document.addEventListener('keydown',e=>{if(e.key==='Escape'){$('userDropdown').hidden=true;$('userMenuButton').setAttribute('aria-expanded','false');}});
+    window.addEventListener('hashchange',routeFromHash); window.addEventListener('popstate',routeFromHash);
     $('forgotPassword').onclick=sendPasswordRecovery;$('recoveryForm').addEventListener('submit',submitPasswordRecovery);
-    $('themeSelect').addEventListener('change',e=>{applyTheme(e.target.value);localStorage.setItem('leetcomp-theme',e.target.value);});
+    document.querySelectorAll('input[name=themeChoice]').forEach(input=>input.addEventListener('change',e=>{applyTheme(e.target.value);localStorage.setItem('leetcomp-theme',e.target.value);}));
     $('saveProfile').onclick=saveProfile;
     $('topics').addEventListener('click',e=>{const b=e.target.closest('[data-topic]');if(b)updateTopic(b.dataset.topic);});
     $('boardDayToggle').onclick=()=>{boardOffset=boardOffset?0:1;renderBoard();};
     $('enterArena').onclick=enterArena;$('runCode').onclick=runCode;$('submitCode').onclick=()=>finishRace(false);$('exitLockdown').onclick=()=>finishRace(false);
-    $('returnHome').onclick=()=>{ $('resultDialog').hidden=true;$('siteHeader').hidden=false;$('appView').hidden=false;renderHome(); };
+    $('returnHome').onclick=()=>{ $('resultDialog').hidden=true;$('siteHeader').hidden=false;$('appView').hidden=false;$('userMenu').hidden=false;history.replaceState({page:'home'},'','#home');renderHome();routeFromHash(); };
     $('clearData').onclick=async()=>{if(!confirm('Delete all LeetComp accounts, races, and scores stored in this browser?'))return;localStorage.removeItem(SESSION_KEY);database.close();(await idb()).close();const req=indexedDB.deleteDatabase(DB_NAME);req.onsuccess=()=>location.reload();req.onerror=()=>alert('The browser could not clear the local database.');};
     window.addEventListener('beforeunload',e=>{if(attemptId&&!finished&&attemptDeadline>Date.now()){saveAttempt(getCode());e.preventDefault();e.returnValue='Your race is still active.';}});
     window.addEventListener('popstate',()=>{if(attemptId&&!finished&&attemptDeadline>Date.now())window.history.pushState({locked:true},'',location.href);});

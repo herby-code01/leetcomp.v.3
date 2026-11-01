@@ -123,7 +123,8 @@
       if (authMode === 'signup') {
         if (username.length < 3 || username.length > 20) throw new Error('Username must be 3 to 20 characters.');
         if (!/^[A-Za-z0-9_]+$/.test(username)) throw new Error('Use letters, numbers, or underscores for your username.');
-        const { data, error } = await sb.auth.signUp({ email, password, options: { data: { username } } });
+        const emailRedirectTo = new URL("./", window.location.href).href;
+        const { data, error } = await sb.auth.signUp({ email, password, options: { data: { username }, emailRedirectTo } });
         if (error) throw error;
         if (!data.session) { safeText($('authMessage'), 'Check your email to confirm your account, then sign in.'); return; }
         await syncLocalUser(data.user);

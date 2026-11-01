@@ -81,6 +81,56 @@
     return bytesHex(bits);
   }
   function safeText(el, value) { el.textContent = value == null ? '' : String(value); }
+  const THEMES = new Set(['midnight','slate','arctic','violet']);
+  function applyTheme(theme = localStorage.getItem('leetcomp-theme') || 'midnight') {
+    if (!THEMES.has(theme)) theme = 'midnight';
+    document.documentElement.dataset.theme = theme;
+    const select = $('themeSelect'); if (select) select.value = theme;
+  }
+  function renderSettings() {
+    if (!currentUser) return;
+    $('settingsEmail').value = currentUser.email || '';
+    $('settingsDisplayName').value = currentUser.displayName || currentUser.username;
+    applyTheme();
+  }
+  async function saveProfile() {
+    const displayName = $('settingsDisplayName').value.trim();
+    if (!displayName || displayName.length > 60) { safeText($('profileMessage'), 'Display name must be 1 to 60 characters.'); return; }
+    $('saveProfile').disabled = true;
+    try {
+      const { data, error } = await sb.auth.updateUser({ data: { ...currentUser.userMetadata, display_name: displayName } });
+      if (error) throw error;
+      const { error: profileError } = await sb.from('profiles').update({ display_name: displayName }).eq('id', currentUser.authUid);
+      if (profileError) throw profileError;
+      currentUser.displayName = displayName; currentUser.userMetadata = data.user.user_metadata;
+      $('userName').textContent = displayName; safeText($('profileMessage'), 'Profile saved.');
+    } catch (error) { safeText($('profileMessage'), error.message || 'Could not save profile.'); }
+    finally { $('saveProfile').disabled = false; }
+  }
+  async function sendPasswordRecovery() {
+    const email = $('loginEmail').value.trim();
+    safeText($('authMessage'), '');
+    if (!email) { safeText($('authMessage'), 'Enter your account email first.'); $('loginEmail').focus(); return; }
+    $('forgotPassword').disabled = true;
+    try {
+      const redirectTo = new URL('./?password-reset=1', window.location.href).href;
+      const { error } = await sb.auth.resetPasswordForEmail(email, { redirectTo });
+      if (error) throw error;
+      safeText($('authMessage'), 'If an account matches that address, a password reset email is on its way.');
+    } catch (error) { safeText($('authMessage'), error.message || 'Could not send the reset email.'); }
+    finally { $('forgotPassword').disabled = false; }
+  }
+  async function submitPasswordRecovery(event) {
+    event.preventDefault(); safeText($('recoveryMessage'), '');
+    const password = $('newPassword').value;
+    if (password.length < 8) { safeText($('recoveryMessage'), 'Use a password with at least 8 characters.'); return; }
+    const { error } = await sb.auth.updateUser({ password });
+    if (error) { safeText($('recoveryMessage'), error.message); return; }
+    await sb.auth.signOut();
+    history.replaceState(null, '', new URL('./', location.href).pathname);
+    $('recoveryView').hidden = true; $('authView').hidden = false; setAuthMode('login');
+    safeText($('authMessage'), 'Password updated. Sign in with your new password.');
+  }
   function dayString(d = new Date()) { return d.toISOString().slice(0, 10); }
   function dayOrdinal() { const [y,m,d] = dayString().split('-').map(Number); return Math.floor(Date.UTC(y,m-1,d) / 86400000); }
   function todayProblem(topic) {
@@ -96,21 +146,27 @@
     $('showLogin').classList.toggle('active', mode === 'login'); $('showSignup').classList.toggle('active', mode === 'signup');
     $('authSubmit').textContent = mode === 'login' ? 'Sign in' : 'Create account';
     $('password').autocomplete = mode === 'login' ? 'current-password' : 'new-password';
+    $('forgotPassword').hidden = mode === 'signup';
     document.querySelectorAll('.signup-only').forEach(el => el.hidden = mode !== 'signup');
     document.querySelectorAll('.login-only').forEach(el => el.hidden = mode === 'signup');
     $('loginEmail').required = mode === 'login'; $('email').required = mode === 'signup'; $('username').required = mode === 'signup';
     safeText($('authMessage'), '');
   }
   async function syncLocalUser(authUser) {
-    const username = authUser.user_metadata?.username || authUser.email.split('@')[0].replace(/[^A-Za-z0-9_]/g, '').slice(0, 20) || 'coder';
+    const metadata = authUser.user_metadata || {};
+    const username = metadata.username || authUser.email.split('@')[0].replace(/[^A-Za-z0-9_]/g, '').slice(0, 20) || 'coder';
+    const displayName = metadata.display_name || username;
+    const { error: profileError } = await sb.from('profiles').upsert({ id: authUser.id, email: authUser.email, username, display_name: displayName }, { onConflict: 'id' });
+    if (profileError) throw new Error('Your account is signed in, but its profile could not be saved: ' + profileError.message);
     let user = row('SELECT id,username FROM users WHERE username=?', [username]);
     if (!user) {
       const salt = bytesHex(crypto.getRandomValues(new Uint8Array(16)));
       sqlRun('INSERT INTO users(username,salt,password_hash,created_at) VALUES(?,?,?,?)', [username, salt, 'supabase-auth', new Date().toISOString()]);
       await persist(); user = row('SELECT id,username FROM users WHERE username=?', [username]);
     }
-    currentUser = { ...user, authUid: authUser.id };
-    $('userName').textContent = currentUser.username;
+    currentUser = { ...user, authUid: authUser.id, email: authUser.email, displayName, userMetadata: metadata };
+    $('userName').textContent = displayName;
+    renderSettings();
   }
   async function authSubmit(event) {
     event.preventDefault(); safeText($('authMessage'), ''); $('authSubmit').disabled = true;
@@ -124,9 +180,10 @@
         if (username.length < 3 || username.length > 20) throw new Error('Username must be 3 to 20 characters.');
         if (!/^[A-Za-z0-9_]+$/.test(username)) throw new Error('Use letters, numbers, or underscores for your username.');
         const emailRedirectTo = new URL("./", window.location.href).href;
-        const { data, error } = await sb.auth.signUp({ email, password, options: { data: { username }, emailRedirectTo } });
+        const displayName = $('displayName').value.trim() || username;
+        const { data, error } = await sb.auth.signUp({ email, password, options: { data: { username, display_name: displayName }, emailRedirectTo } });
         if (error) throw error;
-        if (!data.session) { safeText($('authMessage'), 'Check your email to confirm your account, then sign in.'); return; }
+        if (!data.session) { safeText($('authMessage'), 'Account created. Sign in to continue. If confirmation is still enabled, use the email link first.'); return; }
         await syncLocalUser(data.user);
       } else {
         const { data, error } = await sb.auth.signInWithPassword({ email, password });
@@ -142,6 +199,9 @@
   async function restoreSession() {
     if (!sb) return;
     const { data } = await sb.auth.getSession();
+    const hashParams = new URLSearchParams(location.hash.replace(/^#/, ''));
+    const isPasswordRecovery = new URLSearchParams(location.search).get('password-reset') === '1' || hashParams.get('type') === 'recovery';
+    if (isPasswordRecovery && data.session?.user) { $('authView').hidden = true; $('recoveryView').hidden = false; return; }
     if (data.session?.user) {
       await syncLocalUser(data.session.user); $('authView').hidden = true; $('appView').hidden = false; $('signOut').hidden = false;
       renderHome(); await resumeRace();
@@ -323,7 +383,11 @@
     const result={accepted:attempt.accepted===1,error:attempt.error,passed:attempt.passed,total:attempt.total,runtime_ms:attempt.runtime_ms,memory_mb:attempt.memory_mb};await showFinalResult(result,attempt.submitted_at);
   }
   function bind() {
+    applyTheme();
     $('showLogin').onclick=()=>setAuthMode('login');$('showSignup').onclick=()=>setAuthMode('signup');$('authForm').addEventListener('submit',authSubmit);$('signOut').onclick=signOut;
+    $('forgotPassword').onclick=sendPasswordRecovery;$('recoveryForm').addEventListener('submit',submitPasswordRecovery);
+    $('themeSelect').addEventListener('change',e=>{applyTheme(e.target.value);localStorage.setItem('leetcomp-theme',e.target.value);});
+    $('saveProfile').onclick=saveProfile;
     $('topics').addEventListener('click',e=>{const b=e.target.closest('[data-topic]');if(b)updateTopic(b.dataset.topic);});
     $('boardDayToggle').onclick=()=>{boardOffset=boardOffset?0:1;renderBoard();};
     $('enterArena').onclick=enterArena;$('runCode').onclick=runCode;$('submitCode').onclick=()=>finishRace(false);$('exitLockdown').onclick=()=>finishRace(false);

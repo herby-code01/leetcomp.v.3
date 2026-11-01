@@ -1,6 +1,29 @@
 -- Shared daily topic standings for authenticated LeetComp users.
--- Run this once in the Supabase SQL Editor after schema.sql.
+-- Run this migration in the Supabase SQL Editor. Re-running it updates the leaderboard functions safely.
 create extension if not exists pgcrypto;
+
+create table if not exists public.profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  email text not null,
+  username text not null,
+  display_name text not null default '',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create unique index if not exists profiles_username_ci on public.profiles (lower(username));
+alter table public.profiles enable row level security;
+revoke all on public.profiles from anon, authenticated;
+grant select, insert, update on public.profiles to authenticated;
+drop policy if exists "Players read their own profile" on public.profiles;
+create policy "Players read their own profile" on public.profiles
+  for select to authenticated using ((select auth.uid()) = id);
+drop policy if exists "Players create their own profile" on public.profiles;
+create policy "Players create their own profile" on public.profiles
+  for insert to authenticated with check ((select auth.uid()) = id);
+drop policy if exists "Players update their own profile" on public.profiles;
+create policy "Players update their own profile" on public.profiles
+  for update to authenticated using ((select auth.uid()) = id)
+  with check ((select auth.uid()) = id);
 
 create table if not exists public.competition_attempts (
   id uuid primary key default gen_random_uuid(),
@@ -60,9 +83,11 @@ as $$
     from field f where f.state = 'done' and f.accepted is true
   ), scored as (
     select a.*,
-      case when accepted_count <= 1 or runtime_ms is null then 0::double precision
+      case when accepted_count = 1 and runtime_ms is not null then 100::double precision
+           when accepted_count <= 1 or runtime_ms is null then 0::double precision
            else (accepted_count - runtime_rank - (runtime_ties - 1) / 2.0) * 100.0 / (accepted_count - 1) end as tp,
-      case when accepted_count <= 1 or memory_mb is null then 0::double precision
+      case when accepted_count = 1 and memory_mb is not null then 100::double precision
+           when accepted_count <= 1 or memory_mb is null then 0::double precision
            else (accepted_count - memory_rank - (memory_ties - 1) / 2.0) * 100.0 / (accepted_count - 1) end as sp
     from accepted a
   ), ranked as (
@@ -93,8 +118,10 @@ as $$
     where a.state='done' and a.accepted is true
   ), scored as (
     select a.*,
-      case when n<=1 or runtime_ms is null then 0::double precision else (n-tr-(tt-1)/2.0)*100.0/(n-1) end as tp,
-      case when n<=1 or memory_mb is null then 0::double precision else (n-mr-(mt-1)/2.0)*100.0/(n-1) end as sp
+      case when n=1 and runtime_ms is not null then 100::double precision
+           when n<=1 or runtime_ms is null then 0::double precision else (n-tr-(tt-1)/2.0)*100.0/(n-1) end as tp,
+      case when n=1 and memory_mb is not null then 100::double precision
+           when n<=1 or memory_mb is null then 0::double precision else (n-mr-(mt-1)/2.0)*100.0/(n-1) end as sp
     from accepted a
   ), ranked as (
     select s.*,rank() over (partition by competition_day,topic order by (tp+sp) desc) as place
@@ -121,8 +148,10 @@ as $$
     where a.state='done' and a.accepted is true
   ), scored as (
     select a.*,
-      case when n<=1 or runtime_ms is null then 0::double precision else (n-tr-(tt-1)/2.0)*100.0/(n-1) end as tp,
-      case when n<=1 or memory_mb is null then 0::double precision else (n-mr-(mt-1)/2.0)*100.0/(n-1) end as sp
+      case when n=1 and runtime_ms is not null then 100::double precision
+           when n<=1 or runtime_ms is null then 0::double precision else (n-tr-(tt-1)/2.0)*100.0/(n-1) end as tp,
+      case when n=1 and memory_mb is not null then 100::double precision
+           when n<=1 or memory_mb is null then 0::double precision else (n-mr-(mt-1)/2.0)*100.0/(n-1) end as sp
     from accepted a
   ), ranked as (
     select s.*,rank() over (partition by competition_day,topic order by (tp+sp) desc) as place

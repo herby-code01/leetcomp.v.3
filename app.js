@@ -100,7 +100,7 @@
     try {
       const { data, error } = await sb.auth.updateUser({ data: { ...currentUser.userMetadata, display_name: displayName } });
       if (error) throw error;
-      const { error: profileError } = await sb.from('profiles').update({ display_name: displayName }).eq('id', currentUser.authUid);
+      const { error: profileError } = await sb.from('profiles').update({ display_name: displayName, updated_at: new Date().toISOString() }).eq('id', currentUser.authUid);
       if (profileError) throw profileError;
       currentUser.displayName = displayName; currentUser.userMetadata = data.user.user_metadata;
       $('userName').textContent = displayName; safeText($('profileMessage'), 'Profile saved.');
@@ -113,7 +113,7 @@
     if (!email) { safeText($('authMessage'), 'Enter your account email first.'); $('loginEmail').focus(); return; }
     $('forgotPassword').disabled = true;
     try {
-      const redirectTo = new URL('./?password-reset=1', window.location.href).href;
+      const redirectTo = new URL('./', window.location.href).href;
       const { error } = await sb.auth.resetPasswordForEmail(email, { redirectTo });
       if (error) throw error;
       safeText($('authMessage'), 'If an account matches that address, a password reset email is on its way.');
